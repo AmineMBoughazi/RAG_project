@@ -1,0 +1,17 @@
+[project]
+name = "chatnupload"
+version = "0.1.0"
+description = "Here the code for the Front Interface where the user can drop the documents & chat with the LLM"
+authors = [
+    {name = "Amine.B"},
+    {name = "Samy.A"}
+]
+readme = "README.md"
+requires-python = ">=3.00"
+dependencies = [
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
