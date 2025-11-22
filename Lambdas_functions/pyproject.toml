@@ -1,0 +1,20 @@
+[project]
+name = "lambdas"
+version = "0.1.0"
+description = "Here we can find the code pushed to the different lambdas used in AWS"
+authors = [
+    {name = "Amine.B"},
+    {name = "Samy.A"}
+]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "boto3 (>=1.41.1,<2.0.0)",
+    "awscli (>=1.43.1,<2.0.0)",
+    "psycopg (>=3.2.12,<4.0.0)",
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
