@@ -7,14 +7,11 @@ authors = [
     {name = "Samy.A"}
 ]
 readme = "README.md"
-requires-python = ">=3.12,<4.0"
+requires-python = ">=3.9"
 dependencies = [
     "boto3 (>=1.41.1,<2.0.0)",
     "awscli (>=1.43.1,<2.0.0)",
-    "psycopg2-binary (>=2.9.11,<3.0.0)",
-    "llama-index (>=0.14.8,<0.15.0)",
-    "pymupdf-layout (>=1.26.6,<2.0.0)",
-    "pymupdf4llm (>=0.2.3,<0.3.0)",
+    "psycopg (>=3.2.12,<4.0.0)",
 ]
 
 

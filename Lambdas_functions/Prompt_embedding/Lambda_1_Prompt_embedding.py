@@ -19,6 +19,7 @@ print("connecté à la base")
 
 def generate_embedding(text):
     """Generates a sentence embedding"""
+
     response = bedrock.invoke_model(
         modelId = "amazon.titan-embed-text-v2:0",
         contentType = "application/json",
@@ -83,4 +84,4 @@ def create_tmp_embeddings_table() :
         )
 
 
-lambda_handler()
+#lambda_handler()
