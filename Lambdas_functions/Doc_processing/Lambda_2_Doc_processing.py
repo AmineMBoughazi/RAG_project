@@ -23,6 +23,45 @@ cur =  conn.cursor()
 print("connecté à la base")
 
 
+def create_tables() -> None:
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS chunks_table (
+        chunk_id UUID PRIMARY KEY NOT NULL,
+        document_id UUID FOREIGN KEY NOT NULL,
+        text TEXT NOT NULL,
+        embeddings VECTOR NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        start_offset INTEGER NOT NULL,
+        end_offset INTEGER NOT NULL,
+        page_num INTEGER NOT NULL,
+        image_id UUID FOREIGN KEY,
+        )        
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS documents_table (
+        document_id UUID UUID PRIMARY KEY NOT NULL,
+        source_path TEXT NOT NULL,
+        title TEXT NOT NULL,
+        type TEXT NOT NULL,
+        created_at TIMESTAMP NOT NULL,
+        )        
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS images_table (
+        image_id UUID UUID PRIMARY KEY NOT NULL,
+        document_id UUID FOREIGN KEY NOT NULL,
+        page_number int NOT NULL,
+        title TEXT NOT NULL,
+        image_path TEXT NOT NULL,
+        image_url TEXT NOT NULL,
+        caption TEXT NOT NULL,
+        )        
+    """)
+
+    return
+
 def extract_text_with_images(pdf_path):
     doc = fitz.open(pdf_path)
     pdf_path = Path(pdf_path).resolve()
@@ -123,10 +162,6 @@ def extract_text_with_images(pdf_path):
                     image_bbox["caption_treated"] = True
                     candidates = []
     doc.close()
-    for ii in images_info:
-        print(ii)
-    print('------------------------------------')
-    print(big_text)
     return big_text, images_info
 
 def distance_scoring(bboxt : list, bboxi : list) -> tuple:
@@ -146,15 +181,12 @@ def remove_summary(text,count_balises) :
     lines = text.splitlines()
     tokens = [text.strip().split() for text in lines]
     text_index,lines_index = search_word_first_apparition(tokens)
-    print("premiere apparition de #SOMMAIRE : ",text_index,' - ',lines_index)
     n = 0
     lines_to_pop = list(range(0,lines_index))
     while lines_index < len(lines) :
         text_index = 0
         lines_to_pop.append(lines_index)
-        print(n, ' - ', count_balises)
         while text_index < len(tokens[lines_index]) :
-            print(tokens[lines_index][text_index])
             if "#SOMMAIRE" in tokens[lines_index][text_index]:
                 n += 1
             if n == count_balises:
@@ -170,7 +202,6 @@ def remove_summary(text,count_balises) :
 
 def text_cleaning(text: str) -> str:
     cleaned_text_dots, count_balises = re.subn(r".*\.{2,}.* ?\d+\n?", "#SOMMAIRE", text)
-    print("[INFO] cleaned text : ",cleaned_text_dots)
     cleaned_text_summary = remove_summary(cleaned_text_dots,count_balises)
 
     return cleaned_text_summary
@@ -183,32 +214,35 @@ def sliding_window_chunking(text : str,chunk_window : int = 350,step : int = 100
     image_pattern = re.compile(r'\[IMAGE page=\d+ path=(.*?)\]', re.DOTALL) # [IMAGE page={page_index+1} path={img_path}]
     tokens = clean_text.strip().split()
     i = 0
-    page_index = 0
+    page_index = 1
 
     while i < len(tokens):
         window_text = tokens[i:i+chunk_window]
-        chunk_id = generate_id(" ".join(window_text))
+        chunk = " ".join(window_text)
 
-        page_match = page_pattern.search(" ".join(window_text))
+        page_match = page_pattern.search(chunk)
         if page_match :
-            page_index = page_match.group(1)+1
+            page_index = int(page_match.group(1))+1
+
         doc_page = page_index
 
-        image_match = image_pattern.search(" ".join(window_text))
+        image_match = image_pattern.search(chunk)
         image_url = None
         if image_match:
             image_url = image_match.group(1)
 
-        print(window_text)
-        print('\n')
+        chunk_id = generate_id(chunk)
 
-        chunk = " ".join(window_text)
+        chunk = page_pattern.sub("", chunk)
+        chunk = image_pattern.sub("", chunk)
 
         chunk = {
             "chunk_id": chunk_id,
+            "doc_id": "",
             "doc_page": doc_page,
             "text": chunk.strip(),
             "embedding" :[],
+            "chunk_index" : 0,
             "image_url": image_url,
         }
         chunks.append(chunk)
@@ -230,9 +264,9 @@ def generate_embedding(text):
     return embedding
 
 def embed_chunks(chunks):
-
-    for chunk in chunks:
+    for chunk_index,chunk in enumerate(chunks):
         chunk["embedding"] = generate_embedding(chunk["text"])
+        chunk["chunk_index"] = chunk_index
     return chunks
 
 def lambda_handler(event = -1, context = -1):
@@ -240,5 +274,13 @@ def lambda_handler(event = -1, context = -1):
     doc_id = generate_id(pdf_path)
     text, images = extract_text_with_images(pdf_path)
     chunks = sliding_window_chunking(text)
-    embedding = generate_embedding(text)
+    embedding = embed_chunks(chunks)
+    print("Embedding done")
+
+    for emb in embedding:
+        print(emb)
+        print('\n')
     return
+
+
+lambda_handler()
