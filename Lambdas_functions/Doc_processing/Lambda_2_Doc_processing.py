@@ -2,15 +2,12 @@ import json
 import boto3
 import os
 import psycopg2
-import pymupdf4llm
-import pymupdf.layout
 import hashlib
 import re
 import fitz  # pymupdf
 from pathlib import Path
-from PIL import Image
-import io
-"""
+from typing import List
+
 DB_HOST = "db-embeddings.cjyesqq620p9.eu-west-3.rds.amazonaws.com"
 
 bedrock = boto3.client('bedrock-runtime')
@@ -24,10 +21,9 @@ conn = psycopg2.connect(
 )
 cur =  conn.cursor()
 print("connecté à la base")
-"""
+
 
 def extract_text_with_images(pdf_path):
-    # ouvrir le PDF
     doc = fitz.open(pdf_path)
     pdf_path = Path(pdf_path).resolve()
     out_dir = pdf_path.parent / "extracted_images"
@@ -45,7 +41,7 @@ def extract_text_with_images(pdf_path):
 
         for block_index, block in enumerate(page_dict["blocks"]):
             if block["type"] == 0:  # texte
-                block_text = ""
+                block_text = f"###PAGE_{page_index}####"
 
                 for line in block["lines"]:
                     line_text = ""
@@ -69,7 +65,7 @@ def extract_text_with_images(pdf_path):
             elif block["type"] == 1:  # image
                 image = True
 
-                ################################################ TRAITER L'IMAGE DIRECTEMENT ICI ?
+                ################################################ TRAITER L'IMAGE ICI - SAUVEGARDE SUR LE DISQUE MAIS A TERME SAUVEGARDERA SUR S3
                 try:
                     # On prend la prochaine image de la page
                     img = next(image_iter)
@@ -99,7 +95,7 @@ def extract_text_with_images(pdf_path):
                     print(f"[WARN] Plus d'images dans get_images() pour page {page_index + 1}, block {block_index}")
                 ################################################
 
-                placeholder = f"[IMAGE page={page_index+1} block={block_index}]"
+                placeholder = f"[IMAGE page={page_index+1} path={img_path}]"
                 big_text += "\n" + placeholder + "\n"
                 images_info.append({
                     "page": page_index + 1,
@@ -141,6 +137,83 @@ def distance_scoring(bboxt : list, bboxi : list) -> tuple:
     height_threshold = height_image / 2
     return (dy_below,dy_above,height_threshold)
 
+def remove_summary(text,count_balises) :
+    def search_word_first_apparition(lines):
+        for line_index,text in enumerate(lines):
+            for text_index,word  in enumerate(text):
+                if "#SOMMAIRE" in word:
+                    return text_index, line_index
+    lines = text.splitlines()
+    tokens = [text.strip().split() for text in lines]
+    text_index,lines_index = search_word_first_apparition(tokens)
+    print("premiere apparition de #SOMMAIRE : ",text_index,' - ',lines_index)
+    n = 0
+    lines_to_pop = list(range(0,lines_index))
+    while lines_index < len(lines) :
+        text_index = 0
+        lines_to_pop.append(lines_index)
+        print(n, ' - ', count_balises)
+        while text_index < len(tokens[lines_index]) :
+            print(tokens[lines_index][text_index])
+            if "#SOMMAIRE" in tokens[lines_index][text_index]:
+                n += 1
+            if n == count_balises:
+                break
+            text_index += 1
+        if n == count_balises: break
+        lines_index += 1
+    for idx in sorted(lines_to_pop, reverse=True):
+        lines.pop(idx)
+    text = "\n".join(lines)
+
+    return text
+
+def text_cleaning(text: str) -> str:
+    cleaned_text_dots, count_balises = re.subn(r".*\.{2,}.* ?\d+\n?", "#SOMMAIRE", text)
+    print("[INFO] cleaned text : ",cleaned_text_dots)
+    cleaned_text_summary = remove_summary(cleaned_text_dots,count_balises)
+
+    return cleaned_text_summary
+
+def sliding_window_chunking(text : str,chunk_window : int = 350,step : int = 100):
+    chunks = []
+
+    clean_text = text_cleaning(text)
+    page_pattern = re.compile(r'###PAGE_(.*?)####', re.DOTALL) # ####PAGE_{page_index}###
+    image_pattern = re.compile(r'\[IMAGE page=\d+ path=(.*?)\]', re.DOTALL) # [IMAGE page={page_index+1} path={img_path}]
+    tokens = clean_text.strip().split()
+    i = 0
+    page_index = 0
+
+    while i < len(tokens):
+        window_text = tokens[i:i+chunk_window]
+        chunk_id = generate_id(" ".join(window_text))
+
+        page_match = page_pattern.search(" ".join(window_text))
+        if page_match :
+            page_index = page_match.group(1)+1
+        doc_page = page_index
+
+        image_match = image_pattern.search(" ".join(window_text))
+        image_url = None
+        if image_match:
+            image_url = image_match.group(1)
+
+        print(window_text)
+        print('\n')
+
+        chunk = " ".join(window_text)
+
+        chunk = {
+            "chunk_id": chunk_id,
+            "doc_page": doc_page,
+            "text": chunk.strip(),
+            "embedding" :[],
+            "image_url": image_url,
+        }
+        chunks.append(chunk)
+        i += step
+    return chunks
 
 def generate_id(character):
     return hashlib.md5(character.encode()).hexdigest()
@@ -156,13 +229,16 @@ def generate_embedding(text):
     embedding = json.loads(response["body"].read())['embedding']
     return embedding
 
+def embed_chunks(chunks):
+
+    for chunk in chunks:
+        chunk["embedding"] = generate_embedding(chunk["text"])
+    return chunks
+
 def lambda_handler(event = -1, context = -1):
     pdf_path = "Documents/EXTRAIT_RAG.pdf"
-    doc_id = generate_doc_id(pdf_path)
-
-    text = extract_text_with_images(pdf_path)
+    doc_id = generate_id(pdf_path)
+    text, images = extract_text_with_images(pdf_path)
+    chunks = sliding_window_chunking(text)
+    embedding = generate_embedding(text)
     return
-
-
-#extract_images_from_pdf("Documents/EXTRAIT_RAG.pdf")
-extract_text_with_images("Documents/EXTRAIT_RAG.pdf")
