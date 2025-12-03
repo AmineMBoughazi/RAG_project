@@ -7,20 +7,21 @@ import re
 import fitz  # pymupdf
 from pathlib import Path
 from typing import List
+from dotenv import load_dotenv
 
-DB_HOST = "db-embeddings.cjyesqq620p9.eu-west-3.rds.amazonaws.com"
+load_dotenv()
+
+db_config = {
+    "host": os.getenv("DB_HOST"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "dbname": os.getenv("DB_NAME"),
+    "port": os.getenv("DB_PORT"),
+    "sslmode": os.getenv("DB_SSLMODE"),
+}
+
 
 bedrock = boto3.client('bedrock-runtime')
-
-conn = psycopg2.connect(
-    host=DB_HOST,
-    user="postgres",
-    password="DatabasePassword1234",
-    database="postgres",
-    sslmode="require"
-)
-cur =  conn.cursor()
-print("connecté à la base")
 
 
 def create_tables() -> None:
@@ -277,10 +278,41 @@ def lambda_handler(event = -1, context = -1):
     embedding = embed_chunks(chunks)
     print("Embedding done")
 
-    for emb in embedding:
-        print(emb)
-        print('\n')
-    return
+    DB_HOST = "db-embeddings.cjyesqq620p9.eu-west-3.rds.amazonaws.com"
 
+    try:
+        conn = psycopg2.connect(**db_config)
+        create_tables()
+        print("Connected to the database!")
+        """
+        with connection.cursor() as cursor:
+            final_name = directory_path + "/" + file_name
+            final_name = normalize_file_key(final_name)
+            for segment, vector in zip(final_segments, vectors):
+                # Convertir le vecteur en format JSON
+                vector_json = json.dumps(vector)
+                sql = f"INSERT INTO {target_table} (vector_embedding, text_segment, text_index_lex, doc_title) VALUES (%s, %s, to_tsvector('french', %s), %s)"
+                cursor.execute(sql, (vector_json, segment, segment, final_name))
+                logger.info(f"Inserted segment into {target_table}: {segment}")
+
+        # Valider les changements
+        connection.commit()
+        print("Data inserted successfully!")
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Data inserted successfully!')
+        }
+            """
+    except Exception as e:
+        print(f"Error inserting data: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Error inserting data: {str(e)}')
+        }
+    finally:
+        # Fermer la connexion
+        if 'conn' in locals():
+            conn.close()
+            print("Connexion à la base de données fermée.")
 
 lambda_handler()
