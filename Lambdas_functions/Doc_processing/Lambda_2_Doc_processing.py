@@ -3,11 +3,18 @@ import boto3
 import os
 import psycopg2
 import hashlib
+from psycopg2.extras import execute_values
 import re
 import fitz  # pymupdf
 from pathlib import Path
 from typing import List
 from dotenv import load_dotenv
+import logging
+import urllib.parse
+
+# Logging Configuration
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
 
@@ -22,48 +29,55 @@ db_config = {
 
 
 bedrock = boto3.client('bedrock-runtime')
+s3_client = boto3.client('s3')
 
 
-def create_tables() -> None:
+def create_tables(cur) -> None:
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS documents_table (
+        document_id UUID PRIMARY KEY NOT NULL,
+        source_path TEXT NOT NULL,
+        title TEXT NOT NULL,
+        type TEXT NOT NULL,
+        last_modified TIMESTAMP NOT NULL
+        )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS images_table (
+        image_id UUID PRIMARY KEY NOT NULL,
+        document_id UUID NOT NULL REFERENCES documents_table(document_id) ON DELETE CASCADE,
+        page_number int NOT NULL,
+        image_url TEXT NOT NULL,
+        caption TEXT NOT NULL
+        )        
+    """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS chunks_table (
         chunk_id UUID PRIMARY KEY NOT NULL,
-        document_id UUID FOREIGN KEY NOT NULL,
+        document_id UUID NOT NULL REFERENCES documents_table(document_id) ON DELETE CASCADE,
         text TEXT NOT NULL,
         embeddings VECTOR NOT NULL,
         chunk_index INTEGER NOT NULL,
         start_offset INTEGER NOT NULL,
         end_offset INTEGER NOT NULL,
         page_num INTEGER NOT NULL,
-        image_id UUID FOREIGN KEY,
+        image_id UUID REFERENCES images_table(image_id)
         )        
     """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS documents_table (
-        document_id UUID UUID PRIMARY KEY NOT NULL,
-        source_path TEXT NOT NULL,
-        title TEXT NOT NULL,
-        type TEXT NOT NULL,
-        created_at TIMESTAMP NOT NULL,
-        )        
-    """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS images_table (
-        image_id UUID UUID PRIMARY KEY NOT NULL,
-        document_id UUID FOREIGN KEY NOT NULL,
-        page_number int NOT NULL,
-        title TEXT NOT NULL,
-        image_path TEXT NOT NULL,
-        image_url TEXT NOT NULL,
-        caption TEXT NOT NULL,
-        )        
-    """)
+
 
     return
 
-def extract_text_with_images(pdf_path):
+def extract_text_with_images(file_name,pdf_bytes):
+    pdf_path = f"/tmp/{file_name}"
+    with open(pdf_path, "wb") as pdf_file:
+        pdf_file.write(pdf_bytes)
+
     doc = fitz.open(pdf_path)
     pdf_path = Path(pdf_path).resolve()
     out_dir = pdf_path.parent / "extracted_images"
@@ -135,12 +149,14 @@ def extract_text_with_images(pdf_path):
                     print(f"[WARN] Plus d'images dans get_images() pour page {page_index + 1}, block {block_index}")
                 ################################################
 
-                placeholder = f"[IMAGE page={page_index+1} path={img_path}]"
+                placeholder = f"[IMAGE page={page_index+1} image_id={image_id}]"
                 big_text += "\n" + placeholder + "\n"
                 images_info.append({
+                    "image_id": image_id,
                     "page": page_index + 1,
                     "block_index": block_index,
                     "bbox": block.get("bbox"),
+                    "url" : "",
                     "caption":"",
                     "caption_treated" : False
                 })
@@ -207,18 +223,21 @@ def text_cleaning(text: str) -> str:
 
     return cleaned_text_summary
 
-def sliding_window_chunking(text : str,chunk_window : int = 350,step : int = 100):
+def sliding_window_chunking(text : str,doc_id : str,chunk_window : int = 350,step : int = 100):
     chunks = []
 
     clean_text = text_cleaning(text)
     page_pattern = re.compile(r'###PAGE_(.*?)####', re.DOTALL) # ####PAGE_{page_index}###
-    image_pattern = re.compile(r'\[IMAGE page=\d+ path=(.*?)\]', re.DOTALL) # [IMAGE page={page_index+1} path={img_path}]
+    image_pattern = re.compile(r'\[IMAGE page=\d+ image_id=(.*?)\]', re.DOTALL) # [IMAGE page={page_index+1} path={img_path}]
     tokens = clean_text.strip().split()
     i = 0
     page_index = 1
 
     while i < len(tokens):
+        start_offset = i
+        end_offset = i + chunk_window
         window_text = tokens[i:i+chunk_window]
+
         chunk = " ".join(window_text)
 
         page_match = page_pattern.search(chunk)
@@ -228,9 +247,9 @@ def sliding_window_chunking(text : str,chunk_window : int = 350,step : int = 100
         doc_page = page_index
 
         image_match = image_pattern.search(chunk)
-        image_url = None
+        image_id = None
         if image_match:
-            image_url = image_match.group(1)
+            image_id = image_match.group(1)
 
         chunk_id = generate_id(chunk)
 
@@ -239,12 +258,14 @@ def sliding_window_chunking(text : str,chunk_window : int = 350,step : int = 100
 
         chunk = {
             "chunk_id": chunk_id,
-            "doc_id": "",
+            "doc_id": doc_id,
             "doc_page": doc_page,
             "text": chunk.strip(),
             "embedding" :[],
             "chunk_index" : 0,
-            "image_url": image_url,
+            "start_offset" : start_offset,
+            "end_offset" : end_offset,
+            "image_id" : image_id,
         }
         chunks.append(chunk)
         i += step
@@ -270,30 +291,141 @@ def embed_chunks(chunks):
         chunk["chunk_index"] = chunk_index
     return chunks
 
-def lambda_handler(event = -1, context = -1):
-    pdf_path = "Documents/EXTRAIT_RAG.pdf"
-    doc_id = generate_id(pdf_path)
-    text, images = extract_text_with_images(pdf_path)
-    chunks = sliding_window_chunking(text)
-    embedding = embed_chunks(chunks)
+def download_file_from_s3(bucket_name, file_key):
+    """
+    Downloads a file from S3 and extracts its content as bytes.
+    """
+    try:
+        logger.info(f"Now downloading file: {file_key}")
+
+        # Extract the file name from the file_key
+        file_name = os.path.basename(file_key)
+        logger.info(f"File name: {file_name}")
+
+        # Extract the directory path from the file_key
+        directory_path = os.path.dirname(file_key)
+        logger.info(f"Directory path: {directory_path}")
+
+        local_pdf_path = f"/tmp/{file_name}"
+        s3_client.download_file(bucket_name, file_key, local_pdf_path)
+
+        with open(local_pdf_path, "rb") as pdf_file:
+            pdf_bytes = pdf_file.read()
+
+        response = s3_client.head_object(Bucket=bucket_name, Key=file_key)
+        last_modified = response["LastModified"]
+        doc_type = response["ContentType"].split("/")[1]
+        logger.info(f"Extracted file {file_key} from S3")
+
+        return pdf_bytes, file_name, directory_path, last_modified, doc_type
+
+    except Exception as e:
+        logger.error(f"Error fetching {file_key} from {bucket_name}: {e}")
+        raise
+
+def documents_table_insertion(cursor,document_row):
+    ######## Documents_table population
+    insert_query = """
+                   INSERT INTO documents_table (document_id, \
+                                                source_path, \
+                                                title, \
+                                                type, \
+                                                last_modified)
+                   VALUES (%s, %s, %s, %s, %s) ON CONFLICT (document_id) DO NOTHING; \
+                   """
+    cursor.execute(insert_query, document_row)
+    print("Document inserted to documents_table")
+
+def images_table_insertion(cursor,images,doc_id):
+    insert_query = """
+                   INSERT INTO images_table (image_id, \
+                                             document_id, \
+                                             page_number, \
+                                             image_url, \
+                                             caption)
+                   VALUES %s ON CONFLICT (image_id) DO NOTHING; \
+                   """
+
+    images_rows = [
+        (
+            i["image_id"],
+            doc_id,
+            i["page"],
+            i["url"],
+            i["caption"],
+        )
+        for i in images
+    ]
+    execute_values(cursor, insert_query, images_rows)
+    print("Images inserted to images_table")
+
+def chunks_table_insertion(cursor,chunks):
+    chunk_rows = [
+        (
+            c["chunk_id"],
+            c["doc_id"],
+            c["text"],
+            c["embedding"],
+            c["chunk_index"],
+            c["start_offset"],
+            c["end_offset"],
+            c["doc_page"],
+            c["image_id"],
+        )
+        for c in chunks
+    ]
+    insert_query = """
+                   INSERT INTO chunks_table (chunk_id, \
+                                             document_id, \
+                                             text, \
+                                             embeddings, \
+                                             chunk_index, \
+                                             start_offset, \
+                                             end_offset, \
+                                             page_num, \
+                                             image_id)
+                   VALUES %s ON CONFLICT (chunk_id) DO NOTHING; \
+                   """
+    execute_values(cursor, insert_query, chunk_rows)
+    print("Chunks inserted to chunks_table")
+
+def lambda_handler(event, context = -1):
+
+    file_key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+    bucket_name = event['Records'][0]['s3']['bucket']['name']
+    logger.info(f"Processing file {file_key}")
+
+    # Downloading PDF file from s3
+    pdf_bytes, file_name, directory_path, last_modified, doc_type = download_file_from_s3(bucket_name, file_key)
+    print("File name:", file_name)
+
+    #doc_id creation : same name = same id
+    doc_id = generate_id(file_name)
+
+    #Text & Images Extraction
+    text, images = extract_text_with_images(file_name,pdf_bytes)
+
+    #Text Chunking
+    chunks = sliding_window_chunking(text,doc_id)
+
+    #Chunk Embedding
+    embedded_chunks = embed_chunks(chunks)
     print("Embedding done")
 
-    DB_HOST = "db-embeddings.cjyesqq620p9.eu-west-3.rds.amazonaws.com"
-
     try:
-        conn = psycopg2.connect(**db_config)
-        create_tables()
+        connection = psycopg2.connect(**db_config)
         print("Connected to the database!")
-        """
         with connection.cursor() as cursor:
-            final_name = directory_path + "/" + file_name
-            final_name = normalize_file_key(final_name)
-            for segment, vector in zip(final_segments, vectors):
-                # Convertir le vecteur en format JSON
-                vector_json = json.dumps(vector)
-                sql = f"INSERT INTO {target_table} (vector_embedding, text_segment, text_index_lex, doc_title) VALUES (%s, %s, to_tsvector('french', %s), %s)"
-                cursor.execute(sql, (vector_json, segment, segment, final_name))
-                logger.info(f"Inserted segment into {target_table}: {segment}")
+
+            create_tables(cursor)
+
+            ######## Documents_table population
+            document_row = (doc_id, directory_path, file_name, doc_type, last_modified)
+            documents_table_insertion(cursor, document_row)
+            ######## Images_table population
+            images_table_insertion(cursor, images, doc_id)
+            ######## chunks_table population
+            chunks_table_insertion(cursor, embedded_chunks)
 
         # Valider les changements
         connection.commit()
@@ -302,7 +434,6 @@ def lambda_handler(event = -1, context = -1):
             'statusCode': 200,
             'body': json.dumps('Data inserted successfully!')
         }
-            """
     except Exception as e:
         print(f"Error inserting data: {str(e)}")
         return {
@@ -311,8 +442,11 @@ def lambda_handler(event = -1, context = -1):
         }
     finally:
         # Fermer la connexion
-        if 'conn' in locals():
-            conn.close()
+        if 'connection' in locals():
+            connection.close()
             print("Connexion à la base de données fermée.")
 
-lambda_handler()
+with open("event.txt", "r", encoding="utf-8") as f:
+    event = json.load(f)
+
+lambda_handler(event)

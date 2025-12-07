@@ -2,19 +2,27 @@ import json
 import boto3
 import os
 import psycopg2
+import logging
+from dotenv import load_dotenv
 
-DB_HOST = "db-embeddings.cjyesqq620p9.eu-west-3.rds.amazonaws.com"
+
+# Logging Configuration
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+load_dotenv()
+
+db_config = {
+    "host": os.getenv("DB_HOST"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "dbname": os.getenv("DB_NAME"),
+    "port": os.getenv("DB_PORT"),
+    "sslmode": os.getenv("DB_SSLMODE"),
+}
 
 bedrock = boto3.client('bedrock-runtime')
 
-conn = psycopg2.connect(
-    host=DB_HOST,
-    user="postgres",
-    password="DatabasePassword1234",
-    database="postgres",
-    sslmode="require"
-)
-cur =  conn.cursor()
 print("connecté à la base")
 
 def generate_embedding(text):
@@ -30,58 +38,42 @@ def generate_embedding(text):
     return embedding
 
 def lambda_handler(event = -1, context = -1):
-    prompt = "- Qui est concerné par la réforme de la facturation electronique ?"
+    prompt = "à quoi sert le bloc de donnée de paiement ? "
 
-    prompt_embedding = generate_embedding(prompt)
 
-    create_tmp_embeddings_table()
-
-    query = f"""
-    SELECT 
-    name,
-    id,
-    metadata,
-    vecteur <-> '{prompt_embedding}' as distance
-    FROM embeddings
-    order by distance
-    LIMIT 4
-    """
-    cur.execute(query)
-    responses = cur.fetchall()
-    print(responses)
+    try:
+        connection = psycopg2.connect(**db_config)
+        print("Connected to the database!")
+        with connection.cursor() as cursor:
+            prompt_embedding = generate_embedding(prompt)
+            query = f"""
+            SELECT 
+            chunk_id,
+            document_id,
+            text,
+            image_id,
+            embeddings <-> '{prompt_embedding}' as distance
+            FROM chunks_table
+            order by distance
+            LIMIT 4
+            """
+            cursor.execute(query)
+            responses = cursor.fetchall()
+            for each in responses:
+                print(each)
+                print('\n--------------------------------------------------------------------\n')
+    except Exception as e :
+        print(f"Error inserting data: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Error inserting data: {str(e)}')
+        }
+    finally:
+        # Fermer la connexion
+        if 'connection' in locals():
+            connection.close()
+            print("Connexion à la base de données fermée.")
     return
 
-def create_tmp_embeddings_table() :
 
-    def generate_vector(dim=1024):
-        """Génère un vecteur de 1024 floats pour l'exemple."""
-        import random
-        return [random.uniform(-1, 1) for _ in range(dim)]
-    cur.execute("DROP TABLE IF EXISTS embeddings")
-    query = """
-    CREATE TABLE embeddings (
-    id SERIAL PRIMARY KEY,
-    name TEXT,
-    metadata JSONB,
-    vecteur VECTOR(1024)   -- colonne pgvector
-    );
-    """
-    cur.execute(query)
-    entries = [
-        ("doc_1", 1, {"source": "pdf1", "page": 5}, generate_vector()),
-        ("doc_2", 2, {"source": "pdf2", "page": 12}, generate_vector()),
-        ("doc_3", 3, {"source": "pdf3", "page": 1}, generate_vector()),
-        ("doc_4", 4, {"source": "pdf4", "page": 8}, generate_vector()),
-    ]
-
-    for name, id_val, metadata, vecteur in entries:
-        cur.execute(
-            """
-            INSERT INTO embeddings (name, id, metadata, vecteur)
-            VALUES (%s, %s, %s, %s)
-            """,
-            (name, id_val, json.dumps(metadata), vecteur)
-        )
-
-
-#lambda_handler()
+lambda_handler()
