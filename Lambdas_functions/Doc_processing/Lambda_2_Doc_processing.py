@@ -11,6 +11,7 @@ from typing import List
 from dotenv import load_dotenv
 import logging
 import urllib.parse
+import io
 
 # Logging Configuration
 logger = logging.getLogger(__name__)
@@ -68,10 +69,22 @@ def create_tables(cur) -> None:
         )        
     """)
 
-
-
-
     return
+
+def upload_image_s3(s3_client, image_path,img_bytes):
+    PREFIX = "RAG_Images/"
+    bucket = "amazon-demo-bucket-amine"
+    try:
+        s3_client.upload_fileobj(
+            Fileobj=io.BytesIO(img_bytes),
+            Bucket=bucket,
+            Key=PREFIX + image_path,
+            ExtraArgs={"ContentType": f"image/png"}
+        )
+        s3_url = f"https://{bucket}.s3.eu-west-3.amazonaws.com/{PREFIX}{image_path}"
+    except Exception as e:
+        logger.error(f"Error uploading image to S3 bucket {bucket}: {e}")
+    return s3_url
 
 def extract_text_with_images(file_name,pdf_bytes):
     pdf_path = f"/tmp/{file_name}"
@@ -139,10 +152,10 @@ def extract_text_with_images(file_name,pdf_bytes):
 
                     image_info = doc.extract_image(xref)
                     image_id = generate_id(str(xref))
-                    img_bytes = image_info["image"]
+                    img_bytes = pix.tobytes("png")
                     img_ext = image_info.get("ext", "png")  # png par défaut
-                    img_path = out_dir / f"page{page_index + 1}_img_{image_id}.{img_ext}"
-                    pix.save(img_path)
+                    img_path = f"page{page_index + 1}_img_{image_id}.{img_ext}"
+                    img_url = upload_image_s3(s3_client, img_path,img_bytes)
                     pix = None
 
                 except StopIteration:
@@ -156,7 +169,7 @@ def extract_text_with_images(file_name,pdf_bytes):
                     "page": page_index + 1,
                     "block_index": block_index,
                     "bbox": block.get("bbox"),
-                    "url" : "",
+                    "url" : img_url,
                     "caption":"",
                     "caption_treated" : False
                 })
